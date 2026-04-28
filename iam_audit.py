@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """List all IAM users with their policies, categorized by admin-level access."""
 
 import argparse
@@ -185,7 +184,7 @@ def get_user_detail(username):
     }
 
 
-# ── Styling helpers ────────────────────────────────────────────────────────────
+# -- Styling helpers --
 
 def hdr_cell(ws, row, col, value, bg=COLORS["header_bg"], fg=COLORS["white"], size=11):
     c = ws.cell(row=row, column=col, value=value)
@@ -218,7 +217,7 @@ def write_user_sheet(ws, users, title):
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
 
-    # Title row
+    # Title Row
     ws.merge_cells("A1:H1")
     c = ws["A1"]
     c.value = title
@@ -243,7 +242,7 @@ def write_user_sheet(ws, users, title):
         days = u["days_inactive"]
         inactive_str = f"{days} days" if days is not None else "Never used"
 
-        # Flag notes
+        # Flag Notes
         notes = []
         if cat == "Admin":
             notes.append("⚠ Admin-level access – review immediately")
@@ -256,7 +255,7 @@ def write_user_sheet(ws, users, title):
 
         data_cell(ws, row, 1, idx, alt_bg, align="center")
         data_cell(ws, row, 2, u["name"], alt_bg, bold=(cat == "Admin"))
-        # Category badge
+        # Category Badge
         cat_fg, cat_bg = CATEGORY_COLORS.get(cat, (COLORS["blue_dark"], COLORS["blue_light"]))
         c = ws.cell(row=row, column=3, value=cat)
         c.font = Font(name="Arial", size=10, bold=True, color=cat_fg)
