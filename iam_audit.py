@@ -102,46 +102,51 @@ def get_user_detail(username):
     has_iam_escalation = False
 
     # Attached managed policies
-    for p in iam.list_attached_user_policies(UserName=username)["AttachedPolicies"]:
-        arn = p["PolicyArn"]
-        policies.append(f"[Direct] {p['PolicyName']}")
-        if arn in ADMIN_POLICIES - POWER_POLICIES:
-            is_admin = True
-        if arn in POWER_POLICIES:
-            is_power = True
-
-    # Inline policies
-    for name in iam.list_user_policies(UserName=username)["PolicyNames"]:
-        doc = iam.get_user_policy(UserName=username, PolicyName=name)["PolicyDocument"]
-        admin_flag = is_admin_inline(doc)
-        iam_flag = has_iam_star(doc)
-        tag = " ⚠ ADMIN-LEVEL" if admin_flag else (" ⚠ IAM-ESCALATION" if iam_flag else "")
-        policies.append(f"[Inline] {name}{tag}")
-        if admin_flag:
-            is_admin = True
-        if iam_flag:
-            has_iam_escalation = True
-
-    # Group policies
-    for g in iam.list_groups_for_user(UserName=username)["Groups"]:
-        gname = g["GroupName"]
-        for p in iam.list_attached_group_policies(GroupName=gname)["AttachedPolicies"]:
+    for page in iam.get_paginator("list_attached_user_policies").paginate(UserName=username):
+        for p in page["AttachedPolicies"]:
             arn = p["PolicyArn"]
-            policies.append(f"[Group:{gname}] {p['PolicyName']}")
+            policies.append(f"[Direct] {p['PolicyName']}")
             if arn in ADMIN_POLICIES - POWER_POLICIES:
                 is_admin = True
             if arn in POWER_POLICIES:
                 is_power = True
-        for name in iam.list_group_policies(GroupName=gname)["PolicyNames"]:
-            doc = iam.get_group_policy(GroupName=gname, PolicyName=name)["PolicyDocument"]
+
+    # Inline policies
+    for page in iam.get_paginator("list_user_policies").paginate(UserName=username):
+        for name in page["PolicyNames"]:
+            doc = iam.get_user_policy(UserName=username, PolicyName=name)["PolicyDocument"]
             admin_flag = is_admin_inline(doc)
             iam_flag = has_iam_star(doc)
             tag = " ⚠ ADMIN-LEVEL" if admin_flag else (" ⚠ IAM-ESCALATION" if iam_flag else "")
-            policies.append(f"[Group:{gname}/Inline] {name}{tag}")
+            policies.append(f"[Inline] {name}{tag}")
             if admin_flag:
                 is_admin = True
             if iam_flag:
                 has_iam_escalation = True
+
+    # Group policies
+    for page in iam.get_paginator("list_groups_for_user").paginate(UserName=username):
+        for g in page["Groups"]:
+            gname = g["GroupName"]
+            for gpage in iam.get_paginator("list_attached_group_policies").paginate(GroupName=gname):
+                for p in gpage["AttachedPolicies"]:
+                    arn = p["PolicyArn"]
+                    policies.append(f"[Group:{gname}] {p['PolicyName']}")
+                    if arn in ADMIN_POLICIES - POWER_POLICIES:
+                        is_admin = True
+                    if arn in POWER_POLICIES:
+                        is_power = True
+            for gpage in iam.get_paginator("list_group_policies").paginate(GroupName=gname):
+                for name in gpage["PolicyNames"]:
+                    doc = iam.get_group_policy(GroupName=gname, PolicyName=name)["PolicyDocument"]
+                    admin_flag = is_admin_inline(doc)
+                    iam_flag = has_iam_star(doc)
+                    tag = " ⚠ ADMIN-LEVEL" if admin_flag else (" ⚠ IAM-ESCALATION" if iam_flag else "")
+                    policies.append(f"[Group:{gname}/Inline] {name}{tag}")
+                    if admin_flag:
+                        is_admin = True
+                    if iam_flag:
+                        has_iam_escalation = True
 
     # Determine category
     if is_admin:
@@ -184,7 +189,7 @@ def get_user_detail(username):
     }
 
 
-# -- Styling helpers --
+# Styling helpers
 
 def hdr_cell(ws, row, col, value, bg=COLORS["header_bg"], fg=COLORS["white"], size=11):
     c = ws.cell(row=row, column=col, value=value)
@@ -217,7 +222,7 @@ def write_user_sheet(ws, users, title):
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
 
-    # Title Row
+    # Title row
     ws.merge_cells("A1:H1")
     c = ws["A1"]
     c.value = title
@@ -242,7 +247,7 @@ def write_user_sheet(ws, users, title):
         days = u["days_inactive"]
         inactive_str = f"{days} days" if days is not None else "Never used"
 
-        # Flag Notes
+        # Flag notes
         notes = []
         if cat == "Admin":
             notes.append("⚠ Admin-level access – review immediately")
@@ -255,7 +260,7 @@ def write_user_sheet(ws, users, title):
 
         data_cell(ws, row, 1, idx, alt_bg, align="center")
         data_cell(ws, row, 2, u["name"], alt_bg, bold=(cat == "Admin"))
-        # Category Badge
+        # Category badge
         cat_fg, cat_bg = CATEGORY_COLORS.get(cat, (COLORS["blue_dark"], COLORS["blue_light"]))
         c = ws.cell(row=row, column=3, value=cat)
         c.font = Font(name="Arial", size=10, bold=True, color=cat_fg)
@@ -422,7 +427,10 @@ def main():
     iam = get_iam_client(args.role_arn)
 
     print("Fetching IAM users...")
-    raw_users = iam.list_users()["Users"]
+    raw_users = []
+    paginator = iam.get_paginator("list_users")
+    for page in paginator.paginate():
+        raw_users.extend(page["Users"])
     all_users = []
 
     for i, user in enumerate(raw_users, 1):
