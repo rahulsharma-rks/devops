@@ -94,6 +94,73 @@ def days_since(dt):
     return (now - dt).days
 
 
+# Patterns for classifying standard users
+BASELINE_POLICIES = {"IAMUserChangePassword", "MFAaccess", "IAMReadOnlyAccess", "EnforceMFA", "MFA",
+                     "AWSRevokeOlderSessions"}
+READONLY_KEYWORDS = {"readonly", "readonlyaccess", "read-only", "viewonly", "describe", "list", "get"}
+SERVICE_ACCOUNT_NAMES = {"api-gateway-access", "ses-smtp", "airflow", "homework-sheets-ml",
+                         "insight-extractor-worker", "lokis3bucket", "cloud_cleaner",
+                         "ECS-user", "API_Access", "Platform", "Bachpan-Buddy", "s3-refshift-eks"}
+
+# Map of AWS service prefixes to friendly names
+SERVICE_PREFIX_MAP = {
+    "redshift": "Redshift", "quicksight": "QuickSight", "polly": "Polly",
+    "s3": "S3", "ec2": "EC2", "ecs": "ECS", "lambda": "Lambda",
+    "dynamodb": "DynamoDB", "apigateway": "API Gateway", "api-gateway": "API Gateway",
+    "glue": "Glue", "athena": "Athena", "cloudwatch": "CloudWatch",
+    "eventbridge": "EventBridge", "ssm": "SSM", "codebuild": "CodeBuild",
+    "codepipeline": "CodePipeline", "grafana": "Grafana", "ses": "SES",
+    "secretsmanager": "Secrets Manager", "eks": "EKS", "ecr": "ECR",
+    "vpc": "VPC", "billing": "Billing", "servicequotas": "Service Quotas",
+}
+
+
+def classify_standard_user(username, policies):
+    """Classify a standard user into a sub-category based on policy patterns."""
+    # Check service account by name
+    if username in SERVICE_ACCOUNT_NAMES or not any(c in username for c in ["@", "."]):
+        # Non-email usernames are likely service accounts (heuristic)
+        meaningful = [p for p in policies if not any(b in p for b in BASELINE_POLICIES)]
+        if meaningful:
+            return "Service Account"
+
+    # Strip baseline policies to analyze real access
+    meaningful = []
+    for p in policies:
+        pname = p.split("] ")[1] if "] " in p else p
+        if pname.split(" ⚠")[0].strip() not in BASELINE_POLICIES:
+            meaningful.append(pname.lower())
+
+    if not meaningful:
+        return "Minimal Access"
+
+    # Check if all meaningful policies are read-only
+    is_readonly = all(any(kw in p for kw in READONLY_KEYWORDS) for p in meaningful)
+    if is_readonly:
+        return "ReadOnly"
+
+    # Detect which AWS services are referenced
+    detected_services = set()
+    for p in meaningful:
+        for prefix, svc in SERVICE_PREFIX_MAP.items():
+            if prefix in p:
+                detected_services.add(svc)
+
+    has_write = any("full" in p or "write" in p or "crud" in p or "admin" in p for p in meaningful)
+
+    if len(detected_services) == 1:
+        svc = next(iter(detected_services))
+        return f"Service-Specific ({svc})" if has_write else f"Service-Specific ({svc}, ReadOnly)"
+    elif len(detected_services) >= 3 and has_write:
+        return "Multi-Service Write"
+    elif len(detected_services) >= 2:
+        return "Multi-Service" + (" Write" if has_write else " ReadOnly")
+    elif has_write:
+        return "Single-Service Write"
+    else:
+        return "Limited Access"
+
+
 def get_user_detail(username):
     """Return enriched user detail: policies, admin flag, category, MFA, last activity."""
     policies = []
@@ -151,14 +218,19 @@ def get_user_detail(username):
     # Determine category
     if is_admin:
         category = "Admin"
+        sub_category = ""
     elif has_iam_escalation:
         category = "Privileged"
+        sub_category = ""
     elif is_power:
         category = "Power User"
+        sub_category = ""
     elif not policies:
         category = "No Policies"
+        sub_category = ""
     else:
         category = "Standard"
+        sub_category = classify_standard_user(username, policies)
 
     # MFA status
     try:
@@ -182,6 +254,7 @@ def get_user_detail(username):
 
     return {
         "category": category,
+        "sub_category": sub_category,
         "policies": policies,
         "mfa_enabled": mfa_enabled,
         "last_used": last_used,
@@ -189,7 +262,7 @@ def get_user_detail(username):
     }
 
 
-# Styling helpers
+# ── Styling helpers ────────────────────────────────────────────────────────────
 
 def hdr_cell(ws, row, col, value, bg=COLORS["header_bg"], fg=COLORS["white"], size=11):
     c = ws.cell(row=row, column=col, value=value)
@@ -223,7 +296,7 @@ def write_user_sheet(ws, users, title):
     ws.freeze_panes = "A3"
 
     # Title row
-    ws.merge_cells("A1:H1")
+    ws.merge_cells("A1:I1")
     c = ws["A1"]
     c.value = title
     c.font = Font(bold=True, color=COLORS["white"], size=13, name="Arial")
@@ -231,7 +304,7 @@ def write_user_sheet(ws, users, title):
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
 
-    headers = ["#", "User Name", "Category", "Created Date",
+    headers = ["#", "User Name", "Category", "Sub-Category", "Created Date",
                "MFA Enabled", "Days Inactive", "Policies", "Notes"]
     for col, h in enumerate(headers, 1):
         hdr_cell(ws, 2, col, h)
@@ -268,9 +341,10 @@ def write_user_sheet(ws, users, title):
         c.alignment = Alignment(horizontal="center", vertical="top")
         c.border = THIN_BORDER
 
-        data_cell(ws, row, 4, u["created"], alt_bg, align="center")
+        data_cell(ws, row, 4, u.get("sub_category", "") or "—", alt_bg, align="center")
+        data_cell(ws, row, 5, u["created"], alt_bg, align="center")
         mfa_bg = COLORS["green_light"] if u["mfa_enabled"] == "Yes" else COLORS["red_light"]
-        c = ws.cell(row=row, column=5, value=u["mfa_enabled"])
+        c = ws.cell(row=row, column=6, value=u["mfa_enabled"])
         c.font = Font(name="Arial", size=10, bold=True,
                       color=COLORS["green_dark"] if u["mfa_enabled"] == "Yes" else COLORS["red_dark"])
         c.fill = PatternFill("solid", fgColor=mfa_bg)
@@ -278,23 +352,24 @@ def write_user_sheet(ws, users, title):
         c.border = THIN_BORDER
 
         inactive_bg = COLORS["red_light"] if (days is not None and days > 90) else alt_bg
-        data_cell(ws, row, 6, inactive_str, inactive_bg, align="center")
-        data_cell(ws, row, 7, policies_text, alt_bg, wrap=True)
-        data_cell(ws, row, 8, "\n".join(notes) if notes else "—", alt_bg, wrap=True)
+        data_cell(ws, row, 7, inactive_str, inactive_bg, align="center")
+        data_cell(ws, row, 8, policies_text, alt_bg, wrap=True)
+        data_cell(ws, row, 9, "\n".join(notes) if notes else "—", alt_bg, wrap=True)
 
         line_count = max(policies_text.count("\n") + 1, len(notes) or 1)
         ws.row_dimensions[row].height = max(20, min(line_count * 15, 120))
 
-    col_widths = [5, 24, 14, 14, 12, 14, 58, 38]
+    col_widths = [5, 24, 14, 22, 14, 12, 14, 58, 38]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     # Auto-filter on header row
-    ws.auto_filter.ref = f"A2:H{len(users) + 2}"
+    ws.auto_filter.ref = f"A2:I{len(users) + 2}"
 
 
 def write_summary_sheet(ws, all_users):
     ws.sheet_view.showGridLines = False
+    from collections import Counter
 
     # Title
     ws.merge_cells("A1:F1")
@@ -305,117 +380,288 @@ def write_summary_sheet(ws, all_users):
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 30
 
-    # Category counts
-    from collections import Counter
     cat_counts = Counter(u["category"] for u in all_users)
+    sub_counts = Counter(u.get("sub_category", "") for u in all_users if u["category"] == "Standard")
     mfa_off = sum(1 for u in all_users if u["mfa_enabled"] == "No")
     inactive_90 = sum(1 for u in all_users if u["days_inactive"] is not None and u["days_inactive"] > 90)
+    total = len(all_users) or 1
 
-    # KPI boxes (row 3-6)
+    # KPI boxes
     kpis = [
-        ("Total Users",    len(all_users),                COLORS["blue_dark"],   COLORS["blue_light"]),
-        ("Admin Users",    cat_counts.get("Admin", 0),    COLORS["red_dark"],    COLORS["red_light"]),
-        ("MFA Disabled",   mfa_off,                       COLORS["orange_dark"], COLORS["orange_light"]),
-        ("Inactive 90d+",  inactive_90,                   COLORS["orange_dark"], COLORS["orange_light"]),
-        ("Privileged",     cat_counts.get("Privileged", 0) + cat_counts.get("Power User", 0),
-                                                           COLORS["orange_dark"], COLORS["orange_light"]),
-        ("No Policies",    cat_counts.get("No Policies", 0), COLORS["grey_dark"], COLORS["grey_light"]),
+        ("Total Users",   len(all_users),             COLORS["blue_dark"],   COLORS["blue_light"]),
+        ("Admin Users",   cat_counts.get("Admin", 0), COLORS["red_dark"],    COLORS["red_light"]),
+        ("MFA Disabled",  mfa_off,                    COLORS["orange_dark"], COLORS["orange_light"]),
+        ("Inactive 90d+", inactive_90,                COLORS["orange_dark"], COLORS["orange_light"]),
+        ("Privileged",    cat_counts.get("Privileged", 0) + cat_counts.get("Power User", 0),
+                                                       COLORS["orange_dark"], COLORS["orange_light"]),
+        ("No Policies",   cat_counts.get("No Policies", 0), COLORS["grey_dark"], COLORS["grey_light"]),
     ]
-
     for i, (label, val, fg, bg) in enumerate(kpis, 1):
-        col = i
-        ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=col)
-        ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col)
-        lc = ws.cell(row=3, column=col, value=label)
+        lc = ws.cell(row=3, column=i, value=label)
         lc.font = Font(bold=True, name="Arial", size=10, color=fg)
         lc.fill = PatternFill("solid", fgColor=bg)
         lc.alignment = Alignment(horizontal="center", vertical="center")
         lc.border = THIN_BORDER
-        vc = ws.cell(row=4, column=col, value=val)
+        vc = ws.cell(row=4, column=i, value=val)
         vc.font = Font(bold=True, name="Arial", size=20, color=fg)
         vc.fill = PatternFill("solid", fgColor=bg)
         vc.alignment = Alignment(horizontal="center", vertical="center")
         vc.border = THIN_BORDER
-        ws.row_dimensions[3].height = 20
-        ws.row_dimensions[4].height = 36
-
+    ws.row_dimensions[3].height = 20
+    ws.row_dimensions[4].height = 36
     for col in range(1, 7):
         ws.column_dimensions[get_column_letter(col)].width = 18
 
-    # Category breakdown table
-    ws.merge_cells("A6:F6")
-    hdr = ws["A6"]
-    hdr.value = "User Breakdown by Category"
-    hdr.font = Font(bold=True, color=COLORS["white"], size=11, name="Arial")
-    hdr.fill = PatternFill("solid", fgColor=COLORS["header_bg"])
-    hdr.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[6].height = 22
+    # ── Section 1: High-Level Category Breakdown ──
+    row = 6
+    ws.merge_cells(f"A{row}:F{row}")
+    h = ws[f"A{row}"]
+    h.value = "Section 1: High-Level Category Breakdown"
+    h.font = Font(bold=True, color=COLORS["white"], size=11, name="Arial")
+    h.fill = PatternFill("solid", fgColor=COLORS["header_bg"])
+    h.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[row].height = 22
 
-    table_headers = ["Category", "Count", "% of Total", "Risk Level", "Recommended Action"]
-    for col, h in enumerate(table_headers, 1):
-        hdr_cell(ws, 7, col, h)
+    row += 1
+    for col, hd in enumerate(["Category", "Count", "% of Total", "Risk Level", "Recommended Action"], 1):
+        hdr_cell(ws, row, col, hd)
 
     risk_map = {
-        "Admin":      ("🔴 Critical", "Review & limit immediately; enforce MFA"),
-        "Privileged": ("🟠 High",     "Audit permissions; apply least-privilege"),
-        "Power User": ("🟠 Medium",   "Validate necessity; monitor activity"),
-        "Standard":   ("🟢 Low",      "Routine review; check MFA"),
-        "No Policies":("⚪ Info",     "Remove or assign appropriate policies"),
+        "Admin":      ("🔴 Critical", "Review & limit immediately; enforce MFA; consider SSO roles"),
+        "Privileged": ("🟠 High",     "Audit permissions; apply least-privilege; monitor CloudTrail"),
+        "Power User": ("🟠 Medium",   "Validate necessity; scope down to service-specific access"),
+        "Standard":   ("🟢 Low",      "See sub-category breakdown below for targeted actions"),
+        "No Policies":("⚪ Info",     "Remove unused accounts or assign appropriate policies"),
     }
-    categories = ["Admin", "Privileged", "Power User", "Standard", "No Policies"]
-    total = len(all_users) or 1
-
-    for ridx, cat in enumerate(categories, 8):
+    for cat in ["Admin", "Privileged", "Power User", "Standard", "No Policies"]:
+        row += 1
         cnt = cat_counts.get(cat, 0)
-        pct = f"=B{ridx}/B{ridx - ridx + 8 + len(categories) + 1}"  # formula approach
         risk, action = risk_map[cat]
-        bg = CATEGORY_COLORS.get(cat, (COLORS["blue_dark"], COLORS["blue_light"]))[1]
-        row_bg = bg if ridx % 2 == 0 else COLORS["white"]
+        cat_bg = CATEGORY_COLORS.get(cat, (COLORS["blue_dark"], COLORS["blue_light"]))[1]
+        bg = cat_bg if row % 2 == 0 else COLORS["white"]
+        data_cell(ws, row, 1, cat, bg, bold=True)
+        data_cell(ws, row, 2, cnt, bg, align="center")
+        pc = ws.cell(row=row, column=3, value=cnt / total)
+        pc.number_format = "0.0%"
+        pc.font = Font(name="Arial", size=10)
+        pc.fill = PatternFill("solid", fgColor=bg)
+        pc.alignment = Alignment(horizontal="center", vertical="top")
+        pc.border = THIN_BORDER
+        data_cell(ws, row, 4, risk, bg)
+        data_cell(ws, row, 5, action, bg, wrap=True)
+        ws.row_dimensions[row].height = 22
 
-        data_cell(ws, ridx, 1, cat, row_bg, bold=True)
-        data_cell(ws, ridx, 2, cnt, row_bg, align="center")
-        pct_cell = ws.cell(row=ridx, column=3, value=cnt / total)
-        pct_cell.number_format = "0.0%"
-        pct_cell.font = Font(name="Arial", size=10)
-        pct_cell.fill = PatternFill("solid", fgColor=row_bg)
-        pct_cell.alignment = Alignment(horizontal="center", vertical="top")
-        pct_cell.border = THIN_BORDER
-        data_cell(ws, ridx, 4, risk, row_bg)
-        data_cell(ws, ridx, 5, action, row_bg, wrap=True)
-        ws.row_dimensions[ridx].height = 22
+    # ── Section 2: Standard User Sub-Category Breakdown ──
+    row += 2
+    ws.merge_cells(f"A{row}:F{row}")
+    h = ws[f"A{row}"]
+    h.value = "Section 2: Standard User Sub-Category Breakdown & Recommendations"
+    h.font = Font(bold=True, color=COLORS["white"], size=11, name="Arial")
+    h.fill = PatternFill("solid", fgColor=COLORS["blue_dark"])
+    h.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[row].height = 22
 
-    ws.column_dimensions["D"].width = 16
-    ws.column_dimensions["E"].width = 46
+    row += 1
+    for col, hd in enumerate(["Sub-Category", "Count", "% of Std", "Risk Level", "Recommended Action", "Review Frequency"], 1):
+        hdr_cell(ws, row, col, hd)
 
-    # Top-10 admin/privileged users quick reference
+    std_total = cat_counts.get("Standard", 0) or 1
+    sub_risk_map = {
+        "Multi-Service Write":  ("🟠 Medium-High", "Broad write access across services. Validate each service is needed; use Access Analyzer to generate least-privilege policies; consider splitting into service-specific roles.", "Monthly"),
+        "Service Account":      ("🟠 Medium",      "Programmatic access. Rotate access keys regularly; ensure no console access; restrict to exact API actions needed; tag for automated monitoring.", "Monthly"),
+        "Multi-Service ReadOnly":("🟢 Low-Medium", "Read access across multiple services. Acceptable for analysts/auditors; verify no write actions are needed; check for data-sensitive services.", "Quarterly"),
+        "Service-Specific":     ("🟢 Low",         "Scoped to a single service. Good least-privilege pattern; verify the access level (Full vs Read) matches the role; check for inactive accounts.", "Quarterly"),
+        "ReadOnly":             ("🟢 Low",         "Read-only access. Lowest risk standard pattern; ensure MFA is enabled; routine review only.", "Semi-annually"),
+        "Single-Service Write": ("🟡 Low-Medium",  "Write access to one service. Verify the service and actions are appropriate for the user's role; consider scoping to specific resources.", "Quarterly"),
+        "Limited Access":       ("🟢 Low",         "Narrow permissions that don't fit other patterns. Review policies to confirm they match job function.", "Quarterly"),
+        "Minimal Access":       ("⚪ Info",        "Only baseline IAM/MFA policies. Confirm if user still needs an account; may be candidates for removal if inactive.", "Semi-annually"),
+    }
+
+    # Sort sub-categories by count descending
+    sorted_subs = sorted(sub_counts.items(), key=lambda x: -x[1])
+    # Also include any sub-categories with 0 count from the map
+    seen = {s for s, _ in sorted_subs}
+    for s in sub_risk_map:
+        if s not in seen:
+            sorted_subs.append((s, 0))
+
+    for sub, cnt in sorted_subs:
+        if not sub:
+            continue
+        row += 1
+        # Match sub-category to risk map; handle Service-Specific variants
+        key = sub
+        if sub.startswith("Service-Specific"):
+            key = "Service-Specific"
+        risk, action, freq = sub_risk_map.get(key, ("🟢 Low", "Review policies for appropriateness.", "Quarterly"))
+        bg = COLORS["blue_light"] if row % 2 == 0 else COLORS["white"]
+        data_cell(ws, row, 1, sub, bg, bold=True)
+        data_cell(ws, row, 2, cnt, bg, align="center")
+        pc = ws.cell(row=row, column=3, value=cnt / std_total)
+        pc.number_format = "0.0%"
+        pc.font = Font(name="Arial", size=10)
+        pc.fill = PatternFill("solid", fgColor=bg)
+        pc.alignment = Alignment(horizontal="center", vertical="top")
+        pc.border = THIN_BORDER
+        data_cell(ws, row, 4, risk, bg)
+        data_cell(ws, row, 5, action, bg, wrap=True)
+        data_cell(ws, row, 6, freq, bg, align="center")
+        ws.row_dimensions[row].height = 44
+
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 60
+    ws.column_dimensions["F"].width = 18
+
+    # ── Section 3: High-Risk Users Quick Reference ──
     risky = [u for u in all_users if u["category"] in ("Admin", "Privileged", "Power User")]
     if risky:
-        start_row = 8 + len(categories) + 2
-        ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
-        h = ws.cell(row=start_row, column=1, value="⚠  High-Risk Users – Quick Reference")
+        row += 2
+        ws.merge_cells(f"A{row}:F{row}")
+        h = ws[f"A{row}"]
+        h.value = "Section 3: High-Risk Users – Quick Reference"
         h.font = Font(bold=True, color=COLORS["white"], size=11, name="Arial")
         h.fill = PatternFill("solid", fgColor=COLORS["red_dark"])
         h.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[start_row].height = 22
+        ws.row_dimensions[row].height = 22
 
-        sub_headers = ["User Name", "Category", "MFA", "Days Inactive", "Policy Count", "Notes"]
-        for col, sh in enumerate(sub_headers, 1):
-            hdr_cell(ws, start_row + 1, col, sh, bg=COLORS["red_dark"])
+        row += 1
+        for col, sh in enumerate(["User Name", "Category", "MFA", "Days Inactive", "Policy Count", "Notes"], 1):
+            hdr_cell(ws, row, col, sh, bg=COLORS["red_dark"])
 
-        for ridx, u in enumerate(risky[:20], start_row + 2):
+        for u in risky:
+            row += 1
             notes = []
             if u["mfa_enabled"] == "No":
                 notes.append("No MFA")
             if u["days_inactive"] is not None and u["days_inactive"] > 90:
                 notes.append(f"Inactive {u['days_inactive']}d")
             days_str = f"{u['days_inactive']}d" if u["days_inactive"] is not None else "Never"
-            bg = COLORS["red_light"] if ridx % 2 == 0 else COLORS["white"]
-            data_cell(ws, ridx, 1, u["name"], bg, bold=True)
-            data_cell(ws, ridx, 2, u["category"], bg)
-            data_cell(ws, ridx, 3, u["mfa_enabled"], bg, align="center")
-            data_cell(ws, ridx, 4, days_str, bg, align="center")
-            data_cell(ws, ridx, 5, len(u["policies"]), bg, align="center")
-            data_cell(ws, ridx, 6, "; ".join(notes) if notes else "—", bg)
+            bg = COLORS["red_light"] if row % 2 == 0 else COLORS["white"]
+            data_cell(ws, row, 1, u["name"], bg, bold=True)
+            data_cell(ws, row, 2, u["category"], bg)
+            data_cell(ws, row, 3, u["mfa_enabled"], bg, align="center")
+            data_cell(ws, row, 4, days_str, bg, align="center")
+            data_cell(ws, row, 5, len(u["policies"]), bg, align="center")
+            data_cell(ws, row, 6, "; ".join(notes) if notes else "—", bg)
+
+
+def write_sub_category_sheet(ws, std_users):
+    """Write standard users grouped by sub-category with per-group headers."""
+    ws.sheet_view.showGridLines = False
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for u in std_users:
+        # Normalize Service-Specific variants for grouping
+        sub = u.get("sub_category", "") or "Uncategorized"
+        groups[sub].append(u)
+
+    # Sort groups: Multi-Service Write first (highest risk), then others
+    group_order = ["Multi-Service Write", "Service Account", "Multi-Service ReadOnly",
+                   "Single-Service Write", "Limited Access"]
+    sorted_keys = []
+    for k in group_order:
+        if k in groups:
+            sorted_keys.append(k)
+    for k in sorted(groups.keys()):
+        if k not in sorted_keys:
+            sorted_keys.append(k)
+
+    ws.merge_cells("A1:F1")
+    c = ws["A1"]
+    c.value = "Standard Users – Sub-Category Detail"
+    c.font = Font(bold=True, color=COLORS["white"], size=13, name="Arial")
+    c.fill = PatternFill("solid", fgColor=COLORS["header_bg"])
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    row = 3
+    for sub in sorted_keys:
+        users = groups[sub]
+        # Group header
+        ws.merge_cells(f"A{row}:F{row}")
+        h = ws[f"A{row}"]
+        h.value = f"{sub}  ({len(users)} users)"
+        h.font = Font(bold=True, color=COLORS["white"], size=11, name="Arial")
+        h.fill = PatternFill("solid", fgColor=COLORS["blue_dark"])
+        h.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 24
+        row += 1
+
+        for col, hd in enumerate(["User Name", "Created", "MFA", "Days Inactive", "Policies", "Notes"], 1):
+            hdr_cell(ws, row, col, hd)
+        row += 1
+
+        for u in users:
+            days = u["days_inactive"]
+            days_str = f"{days}d" if days is not None else "Never"
+            policies_text = "\n".join(u["policies"]) if u["policies"] else "—"
+            notes = []
+            if u["mfa_enabled"] == "No":
+                notes.append("No MFA")
+            if days is not None and days > 90:
+                notes.append(f"Inactive {days}d")
+            bg = COLORS["blue_light"] if row % 2 == 0 else COLORS["white"]
+            data_cell(ws, row, 1, u["name"], bg, bold=True)
+            data_cell(ws, row, 2, u["created"], bg, align="center")
+            data_cell(ws, row, 3, u["mfa_enabled"], bg, align="center")
+            data_cell(ws, row, 4, days_str, bg, align="center")
+            data_cell(ws, row, 5, policies_text, bg, wrap=True)
+            data_cell(ws, row, 6, "; ".join(notes) if notes else "—", bg, wrap=True)
+            line_count = policies_text.count("\n") + 1
+            ws.row_dimensions[row].height = max(20, min(line_count * 15, 100))
+            row += 1
+        row += 1  # blank row between groups
+
+    for i, w in enumerate([24, 12, 10, 14, 58, 30], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def write_access_level_sheet(ws, all_users):
+    """Write a simple sheet listing all users with their Access Level (Admin/Standard/Sub-Standard)."""
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    ws.merge_cells("A1:C1")
+    c = ws["A1"]
+    c.value = "IAM Users – Access Level Classification"
+    c.font = Font(bold=True, color=COLORS["white"], size=13, name="Arial")
+    c.fill = PatternFill("solid", fgColor=COLORS["header_bg"])
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    for col, h in enumerate(["#", "User Name", "Access Level"], 1):
+        hdr_cell(ws, 2, col, h)
+
+    level_colors = {
+        "Admin":        (COLORS["red_dark"],    COLORS["red_light"]),
+        "Standard":     (COLORS["blue_dark"],   COLORS["blue_light"]),
+        "Sub-Standard": (COLORS["grey_dark"],   COLORS["grey_light"]),
+    }
+
+    for idx, u in enumerate(all_users, 1):
+        row = idx + 2
+        cat = u["category"]
+        if cat == "Admin":
+            level = "Admin"
+        elif cat in ("Privileged", "Power User", "Standard"):
+            level = "Standard"
+        else:
+            level = "Sub-Standard"
+        fg, bg = level_colors[level]
+        alt = bg if idx % 2 == 0 else COLORS["white"]
+        data_cell(ws, row, 1, idx, alt, align="center")
+        data_cell(ws, row, 2, u["name"], alt)
+        c = ws.cell(row=row, column=3, value=level)
+        c.font = Font(name="Arial", size=10, bold=True, color=fg)
+        c.fill = PatternFill("solid", fgColor=bg)
+        c.alignment = Alignment(horizontal="center", vertical="top")
+        c.border = THIN_BORDER
+
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 18
+    ws.auto_filter.ref = f"A2:C{len(all_users) + 2}"
 
 
 def main():
@@ -472,6 +718,14 @@ def main():
     std_users = [u for u in all_users if u["category"] == "Standard"]
     ws_std = wb.create_sheet("🟢 Standard Users")
     write_user_sheet(ws_std, std_users, "Standard Users")
+
+    # Sheet 6: Standard sub-category detail
+    ws_sub = wb.create_sheet("📋 Standard Sub-Categories")
+    write_sub_category_sheet(ws_sub, std_users)
+
+    # Sheet 7: Access Level (Admin / Standard / Sub-Standard)
+    ws_level = wb.create_sheet("🔑 Access Level")
+    write_access_level_sheet(ws_level, all_users)
 
     wb.save(args.output)
     print(f"\n✅ Report saved: {args.output}")
